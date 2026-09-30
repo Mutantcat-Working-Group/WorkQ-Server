@@ -80,6 +80,7 @@ app.Use(async (context, next) =>
         await context.WriteApiErrorAsync(exception);
     }
 });
+app.UseWebSockets();
 app.UseHttpsRedirection();
 app.UseAuthentication();
 app.UseAuthorization();
