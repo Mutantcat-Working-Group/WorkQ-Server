@@ -1,0 +1,196 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*.*.*"
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_VERSION: "9.0.x"
+  DOTNET_NOLOGO: "true"
+  DOTNET_CLI_TELEMETRY_OPTOUT: "true"
+
+jobs:
+  build-and-test:
+    name: Build and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+      - name: Restore
+        run: dotnet restore WorkQ-Server.sln
+      - name: Build
+        run: dotnet build WorkQ-Server.sln --no-restore -c Release
+      - name: Test
+        run: dotnet test WorkQ-Server.sln --no-build -c Release
+
+  publish:
+    name: Publish ${{ matrix.rid }}
+    needs: build-and-test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            rid: linux-x64
+            binary: workq-server
+            ext: ""
+            archive: tar.gz
+          - os: ubuntu-latest
+            rid: linux-arm64
+            binary: workq-server
+            ext: ""
+            archive: tar.gz
+          - os: ubuntu-latest
+            rid: linux-musl-x64
+            binary: workq-server
+            ext: ""
+            archive: tar.gz
+          - os: ubuntu-latest
+            rid: linux-musl-arm64
+            binary: workq-server
+            ext: ""
+            archive: tar.gz
+          - os: windows-latest
+            rid: win-x64
+            binary: workq-server.exe
+            ext: .exe
+            archive: zip
+          - os: windows-latest
+            rid: win-arm64
+            binary: workq-server.exe
+            ext: .exe
+            archive: zip
+          - os: macos-latest
+            rid: osx-x64
+            binary: workq-server
+            ext: ""
+            archive: tar.gz
+          - os: macos-latest
+            rid: osx-arm64
+            binary: workq-server
+            ext: ""
+            archive: tar.gz
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Publish self-contained binary
+        shell: pwsh
+        run: |
+          $output = Join-Path "${{ github.workspace }}" "artifacts/${{ matrix.rid }}"
+          dotnet publish src/WorkQ.Server/WorkQ.Server.csproj `
+            -c Release `
+            -r ${{ matrix.rid }} `
+            --self-contained true `
+            -p:PublishSingleFile=true `
+            -p:IncludeNativeLibrariesForSelfExtract=true `
+            -p:AssemblyName=workq-server `
+            -p:DebugType=None `
+            -p:DebugSymbols=false `
+            -o $output
+          Remove-Item -LiteralPath (Join-Path $output 'appsettings.Development.json') `
+            -Force -ErrorAction SilentlyContinue
+
+      - name: Rename and checksum
+        shell: pwsh
+        run: |
+          $output = Join-Path "${{ github.workspace }}" "artifacts/${{ matrix.rid }}"
+          $source = Join-Path $output "${{ matrix.binary }}"
+          $target = Join-Path $output "workq-server-${{ matrix.rid }}${{ matrix.ext }}"
+          Move-Item -LiteralPath $source -Destination $target -Force
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $target).Hash.ToLowerInvariant()
+          $checksumPath = Join-Path $output "workq-server-${{ matrix.rid }}.sha256"
+          Set-Content -LiteralPath $checksumPath -Value "$hash  $($target.Name)"
+
+      - name: Package archive
+        shell: pwsh
+        run: |
+          $output = Join-Path "${{ github.workspace }}" "artifacts/${{ matrix.rid }}"
+          $packageDir = Join-Path "${{ github.workspace }}" "packages"
+          New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
+
+          $archiveName = "workq-server-${{ matrix.rid }}.${{ matrix.archive }}"
+          $archivePath = Join-Path $packageDir $archiveName
+          if ("${{ matrix.archive }}" -eq "zip") {
+            Compress-Archive -Path (Join-Path $output '*') -DestinationPath $archivePath -Force
+          } else {
+            tar -czf $archivePath -C $output .
+          }
+
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $archivePath).Hash.ToLowerInvariant()
+          Set-Content -LiteralPath "$archivePath.sha256" -Value "$hash  $archiveName"
+          $hash = (Get-FileHash -Algorithm SHA1 -LiteralPath $archivePath).Hash.ToLowerInvariant()
+          Set-Content -LiteralPath "$archivePath.sha1" -Value "$hash  $archiveName"
+          $hash = (Get-FileHash -Algorithm MD5 -LiteralPath $archivePath).Hash.ToLowerInvariant()
+          Set-Content -LiteralPath "$archivePath.md5" -Value "$hash  $archiveName"
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: workq-server-${{ matrix.rid }}-package
+          path: |
+            packages/workq-server-${{ matrix.rid }}.${{ matrix.archive }}
+            packages/workq-server-${{ matrix.rid }}.${{ matrix.archive }}.sha256
+            packages/workq-server-${{ matrix.rid }}.${{ matrix.archive }}.sha1
+            packages/workq-server-${{ matrix.rid }}.${{ matrix.archive }}.md5
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - build-and-test
+      - publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: release
+
+      - name: Generate combined checksums
+        shell: pwsh
+        run: |
+          $archiveFiles = Get-ChildItem -Path release -Recurse -File |
+            Where-Object { $_.Name -match '^workq-server-.*\.(zip|tar\.gz)$' }
+          foreach ($algorithm in @('MD5', 'SHA1', 'SHA256')) {
+            $lines = foreach ($file in $archiveFiles) {
+              $hash = (Get-FileHash -Algorithm $algorithm -LiteralPath $file.FullName).Hash.ToLowerInvariant()
+              "$hash  $($file.Name)"
+            }
+            $fileName = switch ($algorithm) {
+              'MD5' { 'MD5SUMS.txt' }
+              'SHA1' { 'SHA1SUMS.txt' }
+              'SHA256' { 'SHA256SUMS.txt' }
+            }
+            $checksumPath = Join-Path "${{ github.workspace }}" "release/$fileName"
+            Set-Content -LiteralPath $checksumPath -Value $lines
+          }
+
+      - name: Create release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $assetPaths = Get-ChildItem -Path release -Recurse -File |
+            ForEach-Object { $_.FullName }
+          gh release create "${{ github.ref_name }}" $assetPaths --title "${{ github.ref_name }}" --generate-notes
